@@ -52,6 +52,29 @@ class Status:
                 spread[product] = None  # or float('inf') / -1 if you want to flag missing data
 
         return spread
+    
+    def mid_price(self):
+        buy_orders = self.order_depth.buy_orders
+        sell_orders = self.order_depth.sell_orders
+
+        total_value = 0
+        total_volume = 0
+
+        for price, volume in buy_orders.items():
+            total_value += price * volume
+            total_volume += volume
+
+        for price, volume in sell_orders.items():
+            total_value += price * abs(volume)
+            total_volume += abs(volume)
+
+        if total_volume == 0:
+            return None  # or float('inf') / fallback
+
+        return total_value / total_volume
+
+        
+        
 
 
 class Logic:
@@ -92,13 +115,12 @@ class Logic:
             "max_buy": max(0, max_buy_qty),
             "max_sell": max(0, max_sell_qty)
         }
+
     @staticmethod
     def select_best_ask_fill(
-    status: Status,
-    fair_price: int,
-    order_amount: int = 1,
-) -> Optional[Order]:
-    # Don't call get_possible_quotes again — you already have the status!
+        status: Status,
+        order_amount: int = 1,
+    ) -> Optional[Order]:
         best_bid = max(status.order_depth.buy_orders) if status.order_depth.buy_orders else None
         best_ask = min(status.order_depth.sell_orders) if status.order_depth.sell_orders else None
 
@@ -110,6 +132,11 @@ class Logic:
             proposed_ask = best_ask - 1
 
         if proposed_ask is None:
+            return None
+
+        # Call mid_price() here for the fair price of this product
+        fair_price = status.mid_price()
+        if fair_price is None:
             return None
 
         if proposed_ask not in status.order_depth.sell_orders:
@@ -129,6 +156,7 @@ class Logic:
         return None
 
 
+
 class Trader:
 
     def run(self, state: TradingState):
@@ -139,11 +167,12 @@ class Trader:
             status = Status(product, state)
             orders: List[Order] = []
 
-            # Replace with your model’s fair value estimation
-            fair_price = 100  # Placeholder fair price
+            
+            fair_price = Status.mid_price
 
-            # Example: Use your logic module
-            ask_order = Logic.select_best_ask_fill(status, fair_price)
+            
+            ask_order = Logic.select_best_ask_fill(status)
+
             if ask_order:
                 orders.append(ask_order)
 
