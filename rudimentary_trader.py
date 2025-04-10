@@ -2,14 +2,15 @@ from datamodel import Listing, ConversionObservation, Observation, Order, OrderD
 from typing import List, Optional, Dict
 import string
 import json
+import jsonpickle
 
 
 # Create input storage and functions in this class
 class Status:
 
     _position_limits = {
-        'RAINFOREST_RESIN' : 50,
-        'KELP' : 50,
+        'RAINFOREST_RESIN': 50,
+        'KELP': 50,
     }
 
     _products = ['RAINFOREST_RESIN', 'KELP']
@@ -22,38 +23,46 @@ class Status:
         self.market_trades = state.market_trades.get(product, [])
         self.observations = state.observations
         self.timestamp = state.timestamp
+        
+        # Decode previous trader data to get stored timestamp and other state info
+        try:
+            decoded_trader_data = jsonpickle.decode(state.traderData) if state.traderData else {}
+        except Exception as e:
+            decoded_trader_data = {}
+        # Retrieve the last known timestamp (if any) for this product.
+        self.last_timestamp = decoded_trader_data.get(f"{product}_last_timestamp", None)
 
         limit = self._position_limits[self.product]
         self.possible_buy_amt = max(0, limit - self.position)
         self.possible_sell_amt = max(0, limit + self.position)
 
-
     def best_bid(self):
         best_bid = {}
         for product in self._products:
-            best_bid[product] = min(self.order_depth.buy_orders)
+            best_bid[product] = min(self.order_depth.buy_orders) if self.order_depth and self.order_depth.buy_orders else None
         return best_bid
 
     def best_ask(self):
         best_ask = {}
         for product in self._products:
-            best_ask[product] = min(self.order_depth.sell_orders)
+            best_ask[product] = min(self.order_depth.sell_orders) if self.order_depth and self.order_depth.sell_orders else None
         return best_ask  
-    
+
     def bid_ask_spread(self):
         spread = {}
         best_bids = self.best_bid()
         best_asks = self.best_ask()
-
         for product in self._products:
-            if product in best_bids and product in best_asks:
+            if best_bids.get(product) is not None and best_asks.get(product) is not None:
                 spread[product] = best_asks[product] - best_bids[product]
             else:
-                spread[product] = None  # or float('inf') / -1 if you want to flag missing data
-
+                spread[product] = None  # or another flag value
         return spread
-    
+
     def mid_price(self):
+        if not self.order_depth:
+            return None
+
         buy_orders = self.order_depth.buy_orders
         sell_orders = self.order_depth.sell_orders
 
@@ -69,12 +78,12 @@ class Status:
             total_volume += abs(volume)
 
         if total_volume == 0:
-            return None  # or float('inf') / fallback
+            return None
 
         return total_value / total_volume
+    
 
-        
-        
+
 
 
 class Logic:
@@ -155,33 +164,81 @@ class Logic:
 
         return None
 
+    @staticmethod
+    def mean_reversion(status: Status, trader_data: dict, order_amount: int = 1):
+        """
+        Mean reversion strategy function that:
+          - Decodes and uses previous price history (with timestamps) from trader_data.
+          - Updates a rolling window of mid-price observations.
+          - Computes a simple moving average (SMA).
+          - Places a buy order if the current mid price is significantly below the SMA
+            and a sell order if significantly above.
+          - Updates trader_data with the current timestamp.
+        """
+        product = status.product
+        current_timestamp = status.timestamp
+        mid_price = status.mid_price()
+        if mid_price is None:
+            return [], trader_data
+
+        # Use a product-specific key for storing price history as a list of (timestamp, mid_price) tuples.
+        history_key = f"{product}_price_history"
+        if history_key not in trader_data:
+            trader_data[history_key] = []
+        price_history = trader_data[history_key]
+        
+        # Append current observation
+        price_history.append((current_timestamp, mid_price))
+        # If desired, you could also remove stale entries based on time difference.
+        # For now, we keep a fixed number of most recent observations.
+        if len(price_history) > 20:
+            price_history.pop(0)
+        trader_data[history_key] = price_history
+
+        # Calculate SMA from the collected mid prices.
+        prices = [price for ts, price in price_history]
+        sma = sum(prices) / len(prices)
+
+        # Use a threshold based on 1% of the SMA.
+        threshold = 0.01 * sma
+        orders = []
+        if mid_price < sma - threshold:
+            # Signal to buy if current price is significantly below SMA.
+            if status.order_depth and status.order_depth.sell_orders:
+                best_ask = min(status.order_depth.sell_orders)
+                quantity = min(order_amount, status.possible_buy_amt)
+                orders.append(Order(product, best_ask, quantity))
+        elif mid_price > sma + threshold:
+            # Signal to sell if price is significantly above SMA.
+            if status.order_depth and status.order_depth.buy_orders:
+                best_bid = max(status.order_depth.buy_orders)
+                quantity = min(order_amount, status.possible_sell_amt)
+                orders.append(Order(product, best_bid, -quantity))
+
+        # Update the last seen timestamp for this product in trader_data.
+        trader_data[f"{product}_last_timestamp"] = current_timestamp
+
+        return orders, trader_data
 
 
 class Trader:
 
     def run(self, state: TradingState):
-        result: Dict[str, List[Order]] = {}
-        
+        result = {}  # type: Dict[str, List[Order]]
+        # Decode traderData from the state using jsonpickle
+        try:
+            trader_data = jsonpickle.decode(state.traderData) if state.traderData else {}
+        except Exception:
+            trader_data = {}
 
         for product in state.order_depths:
             status = Status(product, state)
-            orders: List[Order] = []
-
-            
-            fair_price = Status.mid_price
-
-            
-            ask_order = Logic.select_best_ask_fill(status)
-
-            if ask_order:
-                orders.append(ask_order)
-
-            # Optional: add matching bid logic here
-
+            orders, trader_data = Logic.mean_reversion(status, trader_data)
             result[product] = orders
 
-        traderData = "SAMPLE"
-        conversions = 1
+        # Encode trader_data to a string and pass along for future state in the next call.
+        traderData = jsonpickle.encode(trader_data)
+        conversions = 1  # Update this as needed based on conversion logic
         return result, conversions, traderData
 
 
